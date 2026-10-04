@@ -209,6 +209,7 @@ CREATE CUSTOM INDEX IF NOT EXISTS books_published_year_sai ON books (published_y
 The table goes into whatever keyspace the session uses (`ASTRA_DB_KEYSPACE` / `spring.cassandra.keyspace-name`), so the
 entity has no hard-coded keyspace.
 
+> [!NOTE]
 > **Astra gotcha:** on its own, Spring Data turns `@SaiIndexed` into the Cassandra 5 shorthand
 > `CREATE INDEX ... USING 'sai'`. Astra rejects that with *"Cannot specify index class for a non-CUSTOM index"*.
 > [`AstraSchemaCreator`](src/main/java/com/madhavan/demo/spring_data_repository_astradb/astra/AstraSchemaCreator.java)
