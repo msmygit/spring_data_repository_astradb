@@ -1,0 +1,71 @@
+spring:
+  application:
+    name: spring-data-repository-astradb
+  threads:
+    virtual:
+      enabled: true
+  cassandra:
+    # Astra keyspaces are created in the Astra UI/CLI/DevOps API (CQL CREATE KEYSPACE is not allowed on Astra).
+    keyspace-name: ${ASTRA_DB_KEYSPACE:default_keyspace}
+    # Spring Data creates the `books` table and its SAI indexes from the @Table / @SaiIndexed mapping:
+    #   CREATE TABLE IF NOT EXISTS ... / CREATE CUSTOM INDEX IF NOT EXISTS ... USING 'sai'
+    schema-action: create_if_not_exists
+
+# Secrets: only referenced here, supplied by the environment. Nothing secret is stored in the repository.
+astra:
+  db:
+    application-token: ${ASTRA_DB_APPLICATION_TOKEN:}
+    secure-connect-bundle: ${ASTRA_DB_SECURE_BUNDLE_PATH:}
+  driver:
+    reload:
+      enabled: true
+      # How often watched application.yaml files are checked for changes.
+      poll-interval: 5s
+
+# ----------------------------------------------------------------------------------------------------------------------
+# Apache Cassandra Java driver options. Any key from the driver's reference.conf can be used, with the same path:
+#   https://docs.datastax.com/en/developer/java-driver/latest/manual/core/configuration/reference/
+# Override them like any Spring property (./config/application.yaml, profiles, --datastax-java-driver.x.y=...).
+# Edits to an application.yaml on disk are picked up at runtime (see DriverConfigReloader).
+# Contact points, local datacenter and TLS come from the secure connect bundle: do not set them here.
+# ----------------------------------------------------------------------------------------------------------------------
+datastax-java-driver:
+  basic:
+    request:
+      timeout: 10 seconds
+      consistency: LOCAL_QUORUM
+      page-size: 5000
+    # Periodic polling by the driver itself is not needed: DriverConfigReloader triggers a reload on file changes.
+    config-reload-interval: 0
+  advanced:
+    connection:
+      connect-timeout: 10 seconds
+      init-query-timeout: 10 seconds
+      set-keyspace-timeout: 10 seconds
+    control-connection:
+      timeout: 10 seconds
+    metadata:
+      schema:
+        request-timeout: 20 seconds
+        # Only track the application keyspace; keeps metadata refreshes cheap.
+        refreshed-keyspaces:
+          - ${spring.cassandra.keyspace-name}
+
+books:
+  dataset:
+    load: true
+    # https:, file: or classpath: location of the JSON dataset (GPL-2.0, therefore not bundled in this repository).
+    location: https://raw.githubusercontent.com/mouraleonardo/books_dataset/development/books_dataset.json
+    skip-if-loaded: true
+    concurrency: 32
+    chunk-size: 100
+  demo:
+    enabled: true
+
+logging:
+  level:
+    # Uncomment (or pass --logging.level.org.springframework.data.cassandra.core.cql.CqlTemplate=DEBUG)
+    # to print every CQL statement executed by Spring Data.
+    # org.springframework.data.cassandra.core.cql.CqlTemplate: DEBUG
+    com.datastax.oss.driver: WARN
+    com.datastax.oss.driver.internal.core.config: INFO
