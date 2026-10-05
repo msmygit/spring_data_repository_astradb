@@ -94,6 +94,17 @@ books:
   demo:
     enabled: true
 
+# Actuator: expose the /actuator/metrics endpoint so the Astra failover metrics are visible.
+# By default Spring Boot only exposes /actuator/health over HTTP; the full list is opted-in here.
+management:
+  endpoints:
+    web:
+      exposure:
+        include: health, info, metrics
+  endpoint:
+    metrics:
+      enabled: true
+
 logging:
   level:
     # Uncomment (or pass --logging.level.org.springframework.data.cassandra.core.cql.CqlTemplate=DEBUG)

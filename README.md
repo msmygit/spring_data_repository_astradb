@@ -6,7 +6,8 @@ repositories** on Spring Boot 4 / Java 25. It covers:
 | Topic | Where |
 |---|---|
 | Connecting with a secure connect bundle + application token, secrets only from env vars | [`AstraCassandraConfiguration`](src/main/java/com/madhavan/demo/spring_data_repository_astradb/astra/AstraCassandraConfiguration.java), [`AstraDbProperties`](src/main/java/com/madhavan/demo/spring_data_repository_astradb/astra/AstraDbProperties.java) |
-| Any Java driver option configurable in `application.yaml`, **hot-reloaded at runtime** | [`SpringEnvironmentDriverConfigSupplier`](src/main/java/com/madhavan/demo/spring_data_repository_astradb/astra/SpringEnvironmentDriverConfigSupplier.java), [`DriverConfigReloader`](src/main/java/com/madhavan/demo/spring_data_repository_astradb/astra/DriverConfigReloader.java) |
+| **Application-level multi-region failover** — N regions, automatic retry on standby | [`MultiRegionSessionManager`](src/main/java/com/madhavan/demo/spring_data_repository_astradb/astra/MultiRegionSessionManager.java), [`FailoverCassandraOperations`](src/main/java/com/madhavan/demo/spring_data_repository_astradb/astra/FailoverCassandraOperations.java) |
+| Any Java driver option configurable in `application.yaml`, **hot-reloaded at runtime** (all regions) | [`SpringEnvironmentDriverConfigSupplier`](src/main/java/com/madhavan/demo/spring_data_repository_astradb/astra/SpringEnvironmentDriverConfigSupplier.java), [`DriverConfigReloader`](src/main/java/com/madhavan/demo/spring_data_repository_astradb/astra/DriverConfigReloader.java) |
 | `CREATE TABLE IF NOT EXISTS` + SAI indexes derived from the entity mapping | [`Book`](src/main/java/com/madhavan/demo/spring_data_repository_astradb/book/Book.java), [`AstraSchemaCreator`](src/main/java/com/madhavan/demo/spring_data_repository_astradb/astra/AstraSchemaCreator.java) |
 | Derived queries, `@Query`, paging, streaming, projections, `@Consistency`, limiting, count/exists | [`BookRepository`](src/main/java/com/madhavan/demo/spring_data_repository_astradb/book/BookRepository.java) |
 | Custom repository fragment: partial updates, lightweight transactions (LWT) | [`BookRepositoryCustom`](src/main/java/com/madhavan/demo/spring_data_repository_astradb/book/BookRepositoryCustom.java), [`BookRepositoryCustomImpl`](src/main/java/com/madhavan/demo/spring_data_repository_astradb/book/BookRepositoryCustomImpl.java) |
@@ -24,11 +25,14 @@ Stack: Spring Boot 4.1.1 · Spring Data Cassandra 5.1.1 · Apache Cassandra Java
    * New databases come with a keyspace called `default_keyspace`. To use a different keyspace, create it in the
      Astra UI or CLI first: Astra does not allow `CREATE KEYSPACE` over CQL.
 3. An **application token** with a role that can create tables and indexes (for example *Database Administrator*).
-   It looks like `AstraCS:...`.
-4. The database's **secure connect bundle** (`secure-connect-<db>.zip`): *Database → Connect → Drivers → Download
-   bundle*. It contains the contact points, local datacenter and mTLS certificates.
+   It looks like `AstraCS:...`. **The same token is used for all regions** of the same Astra database.
+4. One **secure connect bundle** per region (`secure-connect-<db>-<region>.zip`): *Database → Connect → Drivers →
+   Download bundle* — download one per region you want to connect to. Each bundle contains the contact points,
+   local datacenter and mTLS certificates for that region.
 
 ## 2. Configure: secrets come from environment variables only
+
+### Single-region (default)
 
 ```bash
 export ASTRA_DB_APPLICATION_TOKEN='AstraCS:...'
@@ -45,14 +49,43 @@ spring:
     schema-action: create_if_not_exists
 astra:
   db:
+    application-token: ${ASTRA_DB_APPLICATION_TOKEN:}      # shared by all regions
+    secure-connect-bundle: ${ASTRA_DB_SECURE_BUNDLE_PATH:} # single-region bundle
+```
+
+### Multi-region
+
+The token is set **once** at the top level. Each region entry only needs its own bundle:
+
+```bash
+export ASTRA_DB_APPLICATION_TOKEN='AstraCS:...'
+export ASTRA_DB_BUNDLE_USEAST1=/path/to/secure-connect-useast1.zip
+export ASTRA_DB_BUNDLE_EUWEST1=/path/to/secure-connect-euwest1.zip
+# Optional: override which region is primary (auto-detected from bundle metadata otherwise)
+# export ASTRA_PRIMARY_REGION=us-east-1
+```
+
+```yaml
+astra:
+  db:
     application-token: ${ASTRA_DB_APPLICATION_TOKEN:}
-    secure-connect-bundle: ${ASTRA_DB_SECURE_BUNDLE_PATH:}
+    # primary-region: us-east-1       # optional; auto-detected from datacenter.json in each bundle
+    regions:
+      us-east-1:
+        secure-connect-bundle: ${ASTRA_DB_BUNDLE_USEAST1:}
+        display-name: "US East (N. Virginia)"
+      eu-west-1:
+        secure-connect-bundle: ${ASTRA_DB_BUNDLE_EUWEST1:}
+        display-name: "Europe (Ireland)"
+    failover:
+      enabled: true
+      # max-attempts: 0        # 0 = try all remaining regions (default)
+      read-consistency: LOCAL_QUORUM   # LOCAL_QUORUM (default) or LOCAL_ONE
 ```
 
 * No token or bundle is ever committed. `.gitignore` excludes `*.zip`, `.env` and the local `config/` override folder.
 * `AstraDbProperties#toString()` masks the token, so it can't end up in logs.
-* If a variable is missing, startup fails immediately with an error naming the variable, e.g.
-  `ASTRA_DB_APPLICATION_TOKEN is not set`.
+* If the token variable is missing, startup fails immediately: `ASTRA_DB_APPLICATION_TOKEN is not set`.
 
 ## 3. Run it end to end
 
@@ -341,12 +374,17 @@ datastax-java-driver:
           size: 2
 ```
 
-Within a few seconds the log shows:
+Within a few seconds the log shows (one block per configured region):
 
 ```text
 INFO  DriverConfigReloader    : Detected change in /…/config/application.yaml
 INFO  DefaultDriverConfigLoader : [s0] Detected a configuration change
-INFO  DriverConfigReloader    : Driver configuration reloaded, changed options:
+INFO  DriverConfigReloader    : Driver configuration reloaded for region 'us-east-1', changed options:
+  [default] advanced.connection.pool.remote.size: 1 -> 2
+  [default] basic.request.consistency: LOCAL_QUORUM -> LOCAL_ONE
+  [default] basic.request.page-size: 5000 -> 500
+  [default] basic.request.timeout: 10 seconds -> 3 seconds
+INFO  DriverConfigReloader    : Driver configuration reloaded for region 'eu-west-1', changed options:
   [default] advanced.connection.pool.remote.size: 1 -> 2
   [default] basic.request.consistency: LOCAL_QUORUM -> LOCAL_ONE
   [default] basic.request.page-size: 5000 -> 500
@@ -368,23 +406,146 @@ INFO  DriverConfigReloader    : Driver configuration reloaded, changed options:
 ./mvnw test
 ```
 
-* `SpringEnvironmentDriverConfigSupplierTests` checks YAML → driver options (lists, profiles, precedence, re-reading).
-  No database needed.
-* `AstraSchemaCreatorTests` checks that the SAI DDL renders as `CREATE CUSTOM INDEX … USING 'StorageAttachedIndex'`.
-  No database needed.
-* `BookRepositoryAstraTests` runs repository queries, updates, deletes and LWTs against your Astra database. It runs
-  only when `ASTRA_DB_APPLICATION_TOKEN` and `ASTRA_DB_SECURE_BUNDLE_PATH` are set. It uses its own random
+Tests that require no database:
+
+* `AstraDbPropertiesTests` — checks single-region promotion to `"default"` entry, primary-region resolution order,
+  and `datacenter.json` bundle metadata parsing. Verifies the token is never stored in `RegionConfig`.
+* `MultiRegionSessionManagerTests` — mocks multiple `CqlSession` instances to test session creation, active-region
+  selection, failover switching, health checks, and Micrometer gauge values.
+* `FailoverCassandraOperationsTests` — verifies `shouldFailover` decision logic for every exception type
+  (including LWT boundaries), LWT option detection, and metrics registration.
+* `SpringEnvironmentDriverConfigSupplierTests` — checks YAML → driver options (lists, profiles, precedence,
+  re-reading).
+* `AstraSchemaCreatorTests` — checks that SAI DDL renders as `CREATE CUSTOM INDEX … USING 'StorageAttachedIndex'`.
+
+Tests that require a live Astra database:
+
+* `BookRepositoryAstraTests` — runs repository queries, updates, deletes and LWTs against your Astra database. Runs
+  only when `ASTRA_DB_APPLICATION_TOKEN` and `ASTRA_DB_SECURE_BUNDLE_PATH` are set. Uses its own random
   author/genre values and cleans up after itself.
 
-## 9. Troubleshooting
+## 9. Multi-region failover
+
+The failover layer is transparent to repositories and application code. When `astra.db.regions` is populated:
+
+* **All sessions created at startup** — one `CqlSession` per region, so failover is instant (no cold connection).
+  Standby sessions use `advanced.connection.pool.remote.size=1` to keep resource usage minimal.
+* **Primary region selection** — `ASTRA_PRIMARY_REGION` env var → `astra.db.primary-region` config → auto-detected
+  from `datacenter.json` inside each bundle → first key in `astra.db.regions`.
+* **Failover-eligible exceptions**: `NoNodeAvailableException` (total DC outage), `DriverTimeoutException`,
+  `AllNodesFailedException` with replica-availability causes, and `CoordinatorException` with the same. All other
+  exceptions (syntax errors, auth failures, etc.) propagate immediately.
+* **LWT safety**: for `INSERT … IF NOT EXISTS` / `UPDATE … IF …` / `DELETE … IF EXISTS`, failover is only triggered
+  on `NoNodeAvailableException` (total DC outage). Paxos is DC-local; retrying on a standby on a partial failure
+  could produce duplicates.
+* **Consistency levels**: writes always use `LOCAL_QUORUM` (Astra-enforced). Reads after failover use
+  `astra.db.failover.read-consistency` (default `LOCAL_QUORUM`, can be set to `LOCAL_ONE`).
+* **Micrometer metrics**: `astradb.failover.total` (counter), `astradb.failover.latency` (timer),
+  `astradb.failover.active_region` (gauge), `astradb.session.healthy{region}` (per-region gauge).
+  See section 10 for how to inspect them.
+
+## 10. Metrics
+
+All failover metrics are published through **Micrometer**, which is on the classpath via
+`spring-boot-starter-actuator`. They are available over the Spring Boot Actuator HTTP endpoint
+and can be forwarded to any Micrometer-supported backend (Prometheus, Datadog, CloudWatch, …)
+by adding the corresponding registry dependency.
+
+### Metric reference
+
+| Metric | Type | Description |
+|---|---|---|
+| `astradb.failover.total` | Counter | Number of cross-region failover attempts triggered by `FailoverCassandraOperations` |
+| `astradb.failover.latency` | Timer | Time from detecting the failure to completing the retry on the standby region |
+| `astradb.failover.active_region` | Gauge | Index of the currently active region in the configured-regions list (0 = primary, 1 = first standby, …) |
+| `astradb.session.healthy` | Gauge (tag: `region`) | `1.0` if the session for the tagged region last passed a health check; `0.0` otherwise |
+
+### Inspecting metrics via Actuator
+
+`application.yaml` exposes the `metrics` endpoint over HTTP:
+
+```yaml
+management:
+  endpoints:
+    web:
+      exposure:
+        include: health, info, metrics
+```
+
+While the app is running (use `--spring.main.keep-alive=true`), query the endpoint:
+
+```bash
+# List all registered metric names
+curl -s http://localhost:8080/actuator/metrics | python3 -m json.tool | grep astradb
+
+# Current failover counter value
+curl -s http://localhost:8080/actuator/metrics/astradb.failover.total | python3 -m json.tool
+
+# Active region index (0 = primary)
+curl -s http://localhost:8080/actuator/metrics/astradb.failover.active_region | python3 -m json.tool
+
+# Health of each region (pass the region tag)
+curl -s "http://localhost:8080/actuator/metrics/astradb.session.healthy?tag=region:us-east-1" | python3 -m json.tool
+curl -s "http://localhost:8080/actuator/metrics/astradb.session.healthy?tag=region:eu-west-1" | python3 -m json.tool
+```
+
+Example response for `astradb.session.healthy`:
+
+```json
+{
+  "name": "astradb.session.healthy",
+  "measurements": [{ "statistic": "VALUE", "value": 1.0 }],
+  "availableTags": [{ "tag": "region", "values": ["us-east-1", "eu-west-1"] }]
+}
+```
+
+### Exporting to Prometheus
+
+Add the Micrometer Prometheus registry to `pom.xml`:
+
+```xml
+<dependency>
+  <groupId>io.micrometer</groupId>
+  <artifactId>micrometer-registry-prometheus</artifactId>
+</dependency>
+```
+
+Then expose the scrape endpoint:
+
+```yaml
+management:
+  endpoints:
+    web:
+      exposure:
+        include: health, info, metrics, prometheus
+```
+
+Scrape URL: `http://localhost:8080/actuator/prometheus`
+
+The Astra metrics appear as standard Prometheus gauges and counters:
+
+```text
+# HELP astradb_failover_total Total number of cross-region failover attempts
+# TYPE astradb_failover_total counter
+astradb_failover_total_total 2.0
+
+# HELP astradb_session_healthy
+# TYPE astradb_session_healthy gauge
+astradb_session_healthy{region="us-east-1"} 1.0
+astradb_session_healthy{region="eu-west-1"} 0.0
+```
+
+## 11. Troubleshooting
 
 | Symptom | Fix |
 |---|---|
-| `ASTRA_DB_APPLICATION_TOKEN is not set` / `Secure connect bundle not found` | Export the variables in the same shell; the bundle path must be absolute and readable |
+| `ASTRA_DB_APPLICATION_TOKEN is not set` | Export the variable in the same shell |
+| `Secure connect bundle not found` for a region | The bundle path must be absolute and readable; check the env var for that region |
 | `Keyspace 'x' does not exist` | Create the keyspace in Astra; CQL `CREATE KEYSPACE` is not allowed |
 | `Unauthorized … CREATE` on startup | The token's role can't create tables/indexes. Use a more privileged token, or create the schema yourself and set `spring.cassandra.schema-action=none` |
 | Timeouts right after a database resumes from hibernation | Re-run; or raise `datastax-java-driver.basic.request.timeout` |
 | A write after an `IF …` operation on the same row doesn't stick | See *Don't mix LWT and non-LWT writes* in section 6 |
+| Failover not triggered despite region being unavailable | Confirm `astra.db.failover.enabled=true` and that the standby bundle/region is configured correctly |
 
 ## Dataset
 
