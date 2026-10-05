@@ -14,8 +14,40 @@ spring:
 # Secrets: only referenced here, supplied by the environment. Nothing secret is stored in the repository.
 astra:
   db:
+    # ---- Shared credential (required for all deployment modes) ----
+    # The application token is the same for every region of an Astra DB database.
+    # Set it once here; it is used automatically for all configured regions.
     application-token: ${ASTRA_DB_APPLICATION_TOKEN:}
+
+    # ---- Single-region configuration (backward-compatible) ----
+    # Set only secure-connect-bundle for a single-region deployment.
+    # The bundle is automatically promoted to a "default" region entry so that the rest of
+    # the application can always iterate over astra.db.regions.
     secure-connect-bundle: ${ASTRA_DB_SECURE_BUNDLE_PATH:}
+
+    # ---- Multi-region configuration (optional) ----
+    # Uncomment and populate the block below to enable multi-region support.
+    # When astra.db.regions is non-empty the top-level secure-connect-bundle is ignored.
+    # Each region only needs its own bundle; the shared application-token above covers all.
+    #
+    # primary-region: us-east-1   # Optional: auto-detected from bundle's datacenter.json
+    #                             # Override at runtime with ASTRA_PRIMARY_REGION env var.
+    # regions:
+    #   us-east-1:
+    #     secure-connect-bundle: ${ASTRA_DB_BUNDLE_USEAST1:}
+    #     display-name: "US East (N. Virginia)"
+    #   eu-west-1:
+    #     secure-connect-bundle: ${ASTRA_DB_BUNDLE_EUWEST1:}
+    #     display-name: "Europe (Ireland)"
+
+    # ---- Failover policy ----
+    # Controls application-level cross-region failover behaviour.
+    # Writes always use LOCAL_QUORUM (Astra-enforced); reads are configurable.
+    failover:
+      enabled: true
+      # max-attempts: 0           # 0 = try all remaining regions (default)
+      read-consistency: LOCAL_QUORUM   # LOCAL_QUORUM (default) or LOCAL_ONE
+
   driver:
     reload:
       enabled: true

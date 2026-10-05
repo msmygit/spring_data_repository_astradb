@@ -65,13 +65,14 @@ public class DriverConfigReloader {
 
 	private final ConfigurableEnvironment environment;
 
-	private final ObjectProvider<CqlSession> session;
+	private final ObjectProvider<MultiRegionSessionManager> sessionManager;
 
 	private final Map<Path, WatchedFile> watchedFiles = new LinkedHashMap<>();
 
-	public DriverConfigReloader(ConfigurableEnvironment environment, ObjectProvider<CqlSession> session) {
+	public DriverConfigReloader(ConfigurableEnvironment environment,
+			ObjectProvider<MultiRegionSessionManager> sessionManager) {
 		this.environment = environment;
-		this.session = session;
+		this.sessionManager = sessionManager;
 		discoverConfigFiles();
 	}
 
@@ -139,23 +140,28 @@ public class DriverConfigReloader {
 	}
 
 	/**
-	 * Re-reads the driver configuration from the {@code Environment} and logs the effective differences. Public so it
-	 * can also be triggered programmatically (e.g. from an admin endpoint) after changing property sources.
+	 * Re-reads the driver configuration from the {@code Environment} and logs the effective
+	 * differences for every managed session. Public so it can also be triggered
+	 * programmatically (e.g. from an admin endpoint) after changing property sources.
 	 */
 	public void reloadDriverConfig() {
-		CqlSession cqlSession = this.session.getIfAvailable();
-		if (cqlSession == null) {
+		MultiRegionSessionManager manager = this.sessionManager.getIfAvailable();
+		if (manager == null) {
 			return;
 		}
-		Map<String, Map<String, Object>> before = snapshot(cqlSession);
+		manager.getSessions().forEach((region, session) -> reloadSession(region, session));
+	}
+
+	private void reloadSession(String region, CqlSession session) {
+		Map<String, Map<String, Object>> before = snapshot(session);
 		try {
-			Boolean changed = cqlSession.getContext()
-				.getConfigLoader()
-				.reload()
-				.toCompletableFuture()
-				.get(Duration.ofSeconds(30).toMillis(), TimeUnit.MILLISECONDS);
+			Boolean changed = session.getContext()
+					.getConfigLoader()
+					.reload()
+					.toCompletableFuture()
+					.get(Duration.ofSeconds(30).toMillis(), TimeUnit.MILLISECONDS);
 			if (!Boolean.TRUE.equals(changed)) {
-				log.info("Driver configuration reloaded: no driver options changed");
+				log.info("Driver configuration reloaded for region '{}': no options changed", region);
 				return;
 			}
 		}
@@ -164,10 +170,10 @@ public class DriverConfigReloader {
 			return;
 		}
 		catch (Exception ex) {
-			log.warn("Driver configuration reload failed; the previous configuration stays active", ex);
+			log.warn("Driver configuration reload failed for region '{}'; previous config stays active", region, ex);
 			return;
 		}
-		logDifferences(before, snapshot(cqlSession));
+		logDifferences(region, before, snapshot(session));
 	}
 
 	private static Map<String, Map<String, Object>> snapshot(CqlSession session) {
@@ -180,7 +186,8 @@ public class DriverConfigReloader {
 		return profiles;
 	}
 
-	private static void logDifferences(Map<String, Map<String, Object>> before, Map<String, Map<String, Object>> after) {
+	private static void logDifferences(String region,
+			Map<String, Map<String, Object>> before, Map<String, Map<String, Object>> after) {
 		StringBuilder changes = new StringBuilder();
 		TreeSet<String> profiles = new TreeSet<>(before.keySet());
 		profiles.addAll(after.keySet());
@@ -192,18 +199,18 @@ public class DriverConfigReloader {
 			for (String key : keys) {
 				if (!Objects.equals(old.get(key), now.get(key))) {
 					changes.append(System.lineSeparator())
-						.append("  [")
-						.append(profile)
-						.append("] ")
-						.append(key)
-						.append(": ")
-						.append(old.get(key))
-						.append(" -> ")
-						.append(now.get(key));
+							.append("  [")
+							.append(profile)
+							.append("] ")
+							.append(key)
+							.append(": ")
+							.append(old.get(key))
+							.append(" -> ")
+							.append(now.get(key));
 				}
 			}
 		}
-		log.info("Driver configuration reloaded, changed options:{}", changes);
+		log.info("Driver configuration reloaded for region '{}', changed options:{}", region, changes);
 	}
 
 	private static Path fileOf(OriginTrackedMapPropertySource source) {

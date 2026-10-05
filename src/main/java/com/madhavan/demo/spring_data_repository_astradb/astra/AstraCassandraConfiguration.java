@@ -1,84 +1,112 @@
 package com.madhavan.demo.spring_data_repository_astradb.astra;
 
-import java.nio.file.Files;
-import java.nio.file.Path;
-
 import com.datastax.oss.driver.api.core.CqlSession;
-import com.datastax.oss.driver.api.core.config.DriverConfigLoader;
-import com.datastax.oss.driver.internal.core.config.typesafe.DefaultDriverConfigLoader;
 
-import org.springframework.boot.cassandra.autoconfigure.CqlSessionBuilderCustomizer;
+import org.springframework.beans.factory.ObjectProvider;
 import org.springframework.boot.context.properties.bind.Binder;
 import org.springframework.context.annotation.Bean;
 import org.springframework.context.annotation.Configuration;
+import org.springframework.context.annotation.Primary;
 import org.springframework.core.env.ConfigurableEnvironment;
 import org.springframework.data.cassandra.config.SchemaAction;
 import org.springframework.data.cassandra.config.SessionFactoryFactoryBean;
+import org.springframework.data.cassandra.core.CassandraOperations;
 import org.springframework.data.cassandra.core.convert.CassandraConverter;
-import org.springframework.util.Assert;
-import org.springframework.util.StringUtils;
+
+import io.micrometer.core.instrument.MeterRegistry;
 
 /**
- * Wires the Spring Boot auto-configured {@code CqlSession} to Astra DB.
- * <ul>
- * <li>Connection details (secure connect bundle + token) are applied through a {@link CqlSessionBuilderCustomizer}, the
- * extension point Spring Boot offers for exactly this purpose.</li>
- * <li>Driver options come from the {@code datastax-java-driver.*} section of {@code application.yaml} (or any other
- * Spring property source) via a reloadable {@link DriverConfigLoader}. See {@link SpringEnvironmentDriverConfigSupplier}
- * and {@link DriverConfigReloader}.</li>
- * <li>{@code spring.cassandra.schema-action} is applied with Astra-compatible SAI DDL. See
- * {@link AstraSchemaCreator}.</li>
- * </ul>
+ * Spring configuration for multi-region Astra DB connectivity.
+ *
+ * <p>Replaces the single-session auto-configuration with three collaborating beans:
+ * <ol>
+ *   <li>{@link MultiRegionSessionManager} — owns all {@link CqlSession} instances (one per
+ *       region), tracks the active region, and performs health checks.</li>
+ *   <li>{@link FailoverCassandraOperations} — implements {@link CassandraOperations} by
+ *       delegating to the active region's session and retrying on the next healthy region
+ *       when a failover-eligible exception is thrown.</li>
+ *   <li>{@link SessionFactoryFactoryBean} — runs schema DDL ({@code CREATE TABLE IF NOT EXISTS}
+ *       etc.) once at startup against the active (primary) session.</li>
+ * </ol>
+ *
+ * <p>{@link DriverConfigReloader} is wired separately via its own {@link org.springframework.stereotype.Component}
+ * annotation and continues to hot-reload config on file changes; it is updated here to reload
+ * all sessions managed by {@link MultiRegionSessionManager}.
  */
 @Configuration(proxyBeanMethods = false)
 public class AstraCassandraConfiguration {
 
 	/**
-	 * Astra uses token authentication: the literal user name {@code "token"} and the {@code AstraCS:...} token as the
-	 * password. The bundle carries contact points, the local datacenter and the mTLS material, so none of those are
-	 * configured anywhere else.
+	 * Creates and manages all Astra DB {@link CqlSession} instances.
+	 *
+	 * <p>This bean replaces the single-session {@code CqlSessionBuilderCustomizer} and
+	 * {@code cassandraDriverConfigLoader} beans from the previous single-region configuration.
+	 * Spring Boot's auto-configured {@code CqlSession} is disabled because
+	 * {@link MultiRegionSessionManager} is a {@link org.springframework.stereotype.Component}
+	 * that builds its own sessions, and the {@code cassandraSessionFactory} bean below
+	 * exposes the primary session directly.
+	 *
+	 * <p>Note: {@link MultiRegionSessionManager} is already annotated with
+	 * {@code @Component}, so Spring Boot picks it up automatically; this bean method
+	 * exists here only to make the wiring explicit and to satisfy the
+	 * {@link SessionFactoryFactoryBean} constructor below.
 	 */
 	@Bean
-	CqlSessionBuilderCustomizer astraSessionBuilderCustomizer(AstraDbProperties astra) {
-		Assert.state(StringUtils.hasText(astra.applicationToken()),
-				"ASTRA_DB_APPLICATION_TOKEN is not set (property astra.db.application-token)");
-		Path bundle = astra.secureConnectBundle();
-		Assert.state(bundle != null && !bundle.toString().isBlank(),
-				"ASTRA_DB_SECURE_BUNDLE_PATH is not set (property astra.db.secure-connect-bundle)");
-		Assert.state(Files.isReadable(bundle), () -> "Secure connect bundle not found or not readable: " + bundle);
-		return builder -> builder.withCloudSecureConnectBundle(bundle)
-			.withAuthCredentials("token", astra.applicationToken());
+	MultiRegionSessionManager multiRegionSessionManager(AstraDbProperties properties,
+			ConfigurableEnvironment environment,
+			ObjectProvider<MeterRegistry> meterRegistryProvider) {
+		return new MultiRegionSessionManager(properties, environment, meterRegistryProvider);
 	}
 
 	/**
-	 * Replaces Spring Boot's default loader (which only maps a fixed subset of {@code spring.cassandra.*} and always adds
-	 * a {@code 127.0.0.1:9042} contact point) with one that:
-	 * <ul>
-	 * <li>accepts <em>any</em> option from the driver's
-	 * <a href="https://docs.datastax.com/en/developer/java-driver/latest/manual/core/configuration/reference/">reference
-	 * configuration</a> under {@code datastax-java-driver:} in YAML, and</li>
-	 * <li>supports reloading: every {@link DriverConfigLoader#reload()} re-reads the Spring {@code Environment}.</li>
-	 * </ul>
-	 * The session closes the loader, hence the empty destroy method (same as Spring Boot's own bean).
+	 * Exposes the active region's {@link CqlSession} as the primary {@code CqlSession} bean
+	 * so that Spring Data's auto-configured {@link SessionFactoryFactoryBean} and any other
+	 * infrastructure that injects {@code CqlSession} receive the correct session.
+	 *
+	 * <p>This is a live delegate — the returned session changes whenever
+	 * {@link MultiRegionSessionManager#failoverTo(String)} is called.
 	 */
-	@Bean(destroyMethod = "")
-	DriverConfigLoader cassandraDriverConfigLoader(ConfigurableEnvironment environment) {
-		return new DefaultDriverConfigLoader(new SpringEnvironmentDriverConfigSupplier(environment), true);
+	@Bean
+	@Primary
+	CqlSession cassandraSession(MultiRegionSessionManager sessionManager) {
+		return sessionManager.getActiveSession();
 	}
 
 	/**
-	 * Same as Spring Boot's auto-configured session factory (which backs off when this bean is present), but creates
-	 * {@code @SaiIndexed} indexes with {@code CREATE CUSTOM INDEX ... USING 'StorageAttachedIndex'}.
+	 * Exposes {@link FailoverCassandraOperations} as the primary {@link CassandraOperations}
+	 * bean, replacing the auto-configured {@code CassandraTemplate}.
+	 *
+	 * <p>All Spring Data repositories and custom repository implementations receive this
+	 * failover-aware wrapper instead of a bare {@code CassandraTemplate}.
 	 */
 	@Bean
-	SessionFactoryFactoryBean cassandraSessionFactory(CqlSession session, CassandraConverter converter,
+	@Primary
+	CassandraOperations cassandraOperations(MultiRegionSessionManager sessionManager,
+			CassandraConverter converter,
+			AstraDbProperties properties,
+			ObjectProvider<MeterRegistry> meterRegistryProvider) {
+		return new FailoverCassandraOperations(sessionManager, converter, properties,
+				meterRegistryProvider.getIfAvailable());
+	}
+
+	/**
+	 * Same as Spring Boot's auto-configured session factory (which backs off when this bean
+	 * is present), but creates {@code @SaiIndexed} indexes with
+	 * {@code CREATE CUSTOM INDEX ... USING 'StorageAttachedIndex'}.
+	 *
+	 * <p>Schema DDL runs once at startup against the active (primary) session only. Astra DB
+	 * keyspaces are global; tables and indexes are replicated automatically.
+	 */
+	@Bean
+	SessionFactoryFactoryBean cassandraSessionFactory(MultiRegionSessionManager sessionManager,
+			CassandraConverter converter,
 			ConfigurableEnvironment environment) {
 		AstraSessionFactoryFactoryBean sessionFactory = new AstraSessionFactoryFactoryBean();
-		sessionFactory.setSession(session);
+		sessionFactory.setSession(sessionManager.getActiveSession());
 		sessionFactory.setConverter(converter);
 		Binder.get(environment)
-			.bind("spring.cassandra.schema-action", SchemaAction.class)
-			.ifBound(sessionFactory::setSchemaAction);
+				.bind("spring.cassandra.schema-action", SchemaAction.class)
+				.ifBound(sessionFactory::setSchemaAction);
 		return sessionFactory;
 	}
 
